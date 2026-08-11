@@ -18,3 +18,9 @@ from .configs import DynamoConfig, ExecutorchConfig, ExportConfigMixin, ExportFo
 from .exporter_dynamo import DynamoExporter
 from .exporter_executorch import ExecutorchExporter
 from .exporter_onnx import OnnxExporter
+from .runtime_utils import (
+    ExportedMultimodalGenerator,
+    ExportedTextGenerator,
+    ModalityInput,
+    OnnxModalityFeatures,
+)

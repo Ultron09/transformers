@@ -593,7 +593,9 @@ def precompute_export_inputs(model: torch.nn.Module, inputs: dict[str, Any]) -> 
     """
     # Outer-model: LLM rope index. Self-detecting via `hasattr` since model_type at this level
     # varies (qwen2_vl vs qwen2_5_omni_thinker vs ...) and the get_rope_index signature is stable.
-    if inputs.get("position_ids") is None and hasattr(model, "get_rope_index"):
+    # Requires `input_ids` — `get_rope_index` reads the token ids to place modality positions, so it must
+    # not run on encoder-only components (e.g. an exported `get_image_features`) that carry no `input_ids`.
+    if inputs.get("position_ids") is None and inputs.get("input_ids") is not None and hasattr(model, "get_rope_index"):
         input_ids = inputs.get("input_ids")
         attn_mask = inputs.get("attention_mask")
         is_prefill = attn_mask is None or input_ids is None or input_ids.shape[1] == attn_mask.shape[1]
@@ -847,21 +849,88 @@ def is_multimodal(model: PreTrainedModel | torch.nn.Module) -> bool:
     return isinstance(model, PreTrainedModel) and bool(_find_multimodal_submodules(model))
 
 
+def _component_with_forward(module: PreTrainedModel, forward) -> torch.nn.Module:
+    """A shallow copy of `module` — sharing its weights and submodules, keeping its real class, config and
+    modeling module — with `forward` replaced. Lets us export a model *method* (e.g. `get_image_features`)
+    as a standalone component without a wrapper class, so the export precompute introspects it normally."""
+    component = copy.copy(module)
+    component.forward = forward
+    return component
+
+
+# One row per input modality: (component name, `get_*_features` method, the input kwarg that signals the
+# modality is present, the getter's native grid kwarg — or `None` for audio, the placeholder-id config
+# field). Video/audio slot in exactly like image; a modality is exported only when its getter exists and
+# its input is passed.
+_MODALITY_SPECS = (
+    ("image_encoder", "get_image_features", "pixel_values", "image_grid_thw", "image_token_id"),
+    ("video_encoder", "get_video_features", "pixel_values_videos", "video_grid_thw", "video_token_id"),
+    ("audio_encoder", "get_audio_features", "input_features", None, "audio_token_id"),
+)
+
+
+@contextlib.contextmanager
+def _capture_calls(obj: Any, attribute: str):
+    """Capture the kwargs of each `obj.<attribute>(...)` call during the block (positional args normalised
+    to kwargs), restoring the attribute afterwards. Generalises `_capture_forward` to any method — used to
+    record exactly what the model passes each `get_*_features`, so we don't hardcode per-model input keys."""
+    calls: list[dict] = []
+    original = getattr(obj, attribute)
+    was_instance_attr = attribute in vars(obj)
+    sig = inspect.signature(original)
+
+    @functools.wraps(original)
+    def wrapper(*args, **kwargs):
+        captured = {}
+        for name, value in sig.bind(*args, **kwargs).arguments.items():
+            kind = sig.parameters[name].kind
+            if kind == inspect.Parameter.VAR_KEYWORD:
+                captured.update(copy.deepcopy(value))
+            elif kind != inspect.Parameter.VAR_POSITIONAL:
+                captured[name] = copy.deepcopy(value)
+        calls.append(captured)
+        return original(*args, **kwargs)
+
+    setattr(obj, attribute, wrapper)
+    try:
+        yield calls
+    finally:
+        if was_instance_attr:
+            setattr(obj, attribute, original)
+        else:
+            delattr(obj, attribute)
+
+
+def _features_forward(owner: PreTrainedModel, getter_name: str, grid_key: str | None):
+    """Patched `forward` for a modality component: run `owner.<getter_name>` and normalise its output to a
+    single tensor — concatenating per-item embeds (`.pooler_output` as a list/tuple), else the bare
+    `.pooler_output` / `.last_hidden_state` / tensor. Maps the precompute marker key `grid_thw` back to the
+    getter's native grid kwarg."""
+
+    def forward(**kwargs):
+        if grid_key is not None and "grid_thw" in kwargs:
+            kwargs[grid_key] = kwargs.pop("grid_thw")
+        outputs = getattr(owner, getter_name)(**kwargs)
+        features = getattr(outputs, "pooler_output", None)
+        if features is None:
+            features = getattr(outputs, "last_hidden_state", outputs)
+        return torch.cat(features) if isinstance(features, (tuple, list)) else features
+
+    return forward
+
+
 def decompose_multimodal(model: PreTrainedModel, inputs: dict[str, Any]) -> dict[str, tuple[torch.nn.Module, dict]]:
-    """Capture inputs to each multi-modal submodule via a single forward pass.
+    """Split a multi-modal model into independently exportable `name: (module, inputs)` pairs.
 
-    Detects all known multi-modal submodules by attribute name (vision tower, projector,
-    language model, lm_head, …) and captures their forward kwargs during one
-    `model(**inputs)` call.
+    Exports the model's own composition methods rather than raw submodules, so each component is
+    self-contained and the set can be reassembled into a generation runtime:
+    - `embed_tokens` — `input_ids -> inputs_embeds` (`get_input_embeddings`, placeholder ids zeroed),
+    - `<modality>_encoder` — the modality features (`get_<modality>_features`, i.e. encoder **and**
+      projection), one per input modality present (image / video / audio),
+    - `language_model` / `lm_head` — captured from the forward.
 
-    Each submodule is returned as a separate `name: (module, inputs)` entry for
-    independent export. The token-merge step (e.g. `masked_scatter` for multi-modal models)
-    is intentionally left outside the exported graphs — it is the caller's responsibility
-    to assemble `inputs_embeds` from the encoder outputs before running the decoder.
-
-    Returns:
-        `dict[str, tuple[torch.nn.Module, dict]]`: One `name: (module, inputs)`
-        entry per detected submodule (image/audio encoder, projector, language model, lm_head).
+    The token-merge step (`masked_scatter`) stays outside the graphs — the caller assembles
+    `inputs_embeds` from the encoder outputs before running the decoder.
 
     Raises:
         `ValueError`: if no known multi-modal submodules are found on the model.
@@ -873,10 +942,24 @@ def decompose_multimodal(model: PreTrainedModel, inputs: dict[str, Any]) -> dict
             f"Expected an image/audio encoder + language model, found neither."
         )
 
+    # Each active modality's `get_*_features` is invoked on the base model during `forward` (the outer
+    # `ForConditionalGeneration` getter just delegates), so capture — and later export — from there.
+    base = model.base_model
+    active_modalities = []
+    for name, getter, input_key, grid_key, _token_field in _MODALITY_SPECS:
+        owner = base if hasattr(base, getter) else (model if hasattr(model, getter) else None)
+        if owner is not None and inputs.get(input_key) is not None:
+            active_modalities.append((name, getter, owner, grid_key))
+
+    # `language_model` / `lm_head` take activations, not user inputs, so capture their kwargs; capture each
+    # modality getter's call kwargs — all in one real forward.
+    lm_targets = {name: submodules[name] for name in ("language_model", "lm_head") if name in submodules}
     try:
         with contextlib.ExitStack() as stack, torch.no_grad():
-            submodule_inputs = {
-                name: stack.enter_context(_capture_forward(module)) for name, module in submodules.items()
+            captured_lm = {name: stack.enter_context(_capture_forward(module)) for name, module in lm_targets.items()}
+            captured_features = {
+                name: stack.enter_context(_capture_calls(owner, getter))
+                for name, getter, owner, _ in active_modalities
             }
             model(**copy.deepcopy(inputs))
     except Exception as e:
@@ -884,11 +967,40 @@ def decompose_multimodal(model: PreTrainedModel, inputs: dict[str, Any]) -> dict
             f"decompose_multimodal failed for {type(model).__name__}. Inputs passed: {list(inputs.keys())}."
         ) from e
 
-    return {
-        name: (module, submodule_inputs[name][-1])
-        for name, module in submodules.items()
-        if submodule_inputs[name]  # skip submodules not called (e.g. lm_head on base models)
-    }
+    components = {name: (module, captured_lm[name][-1]) for name, module in lm_targets.items() if captured_lm[name]}
+
+    # embed_tokens: `input_ids -> inputs_embeds`, zeroing the placeholder ids (out of the text vocab)
+    # first, the way a VLM `forward` does before scattering in encoder features. Patched onto the text
+    # decoder (never the outer VLM) so the export precompute's rope branch stays off.
+    embed_tokens = model.get_input_embeddings()
+    placeholder_ids = [
+        getattr(model.config, spec[-1], None)
+        for spec in _MODALITY_SPECS
+        if getattr(model.config, spec[-1], None) is not None
+    ]
+
+    def embed_forward(input_ids):
+        placeholder = torch.zeros_like(input_ids, dtype=torch.bool)
+        for token_id in placeholder_ids:
+            placeholder = placeholder | (input_ids == token_id)
+        return embed_tokens(input_ids.masked_fill(placeholder, 0))
+
+    components["embed_tokens"] = (
+        _component_with_forward(model.get_decoder(), embed_forward),
+        {"input_ids": inputs["input_ids"]},
+    )
+
+    # One feature graph per modality, from the captured getter call — a shallow model copy with `forward`
+    # patched to `get_<modality>_features`, so each keeps the model's real class / config / modeling module.
+    for name, getter, owner, grid_key in active_modalities:
+        calls = captured_features[name]
+        if not calls:
+            continue
+        feature_inputs = {
+            ("grid_thw" if key == grid_key else key): value for key, value in calls[-1].items() if value is not None
+        }
+        components[name] = (_component_with_forward(owner, _features_forward(owner, getter, grid_key)), feature_inputs)
+    return components
 
 
 def decompose_for_generation(
@@ -913,8 +1025,10 @@ def decompose_for_generation(
 
     Returns:
         `{component_name: (submodel, forward_inputs)}`. Keys are `"prefill"` / `"decode"` for
-        plain generative models and `"<modality>_encoder"` / `"multi_modal_projector"` /
-        `"language_model"` / `"lm_head"` / `"decode"` for multi-modal generative models.
+        plain generative models and `"embed_tokens"` / `"image_encoder"` / `"audio_encoder"` /
+        `"language_model"` / `"lm_head"` / `"decode"` for multi-modal generative models. For multi-modal
+        models the `decode` component takes `inputs_embeds` (not `input_ids`) so the caller can scatter the
+        encoder features into the embeddings before running it.
     """
     stages = decompose_prefill_decode(
         model, inputs, generation_config=generation_config, multi_token_decode=multi_token_decode
@@ -925,5 +1039,19 @@ def decompose_for_generation(
         return stages
 
     components = decompose_multimodal(prefill_model, prefill_inputs)
-    components["decode"] = stages["decode"]
+
+    # Feed the decode graph `inputs_embeds` (not `input_ids`) so the runtime can scatter the encoder embeds
+    # into the embeddings before the text stack; the full forward accepts `inputs_embeds` and — with no
+    # modality inputs — skips the encoders. This is what lets the components reassemble into a loop.
+    decode_model, decode_inputs = stages["decode"]
+    decode_inputs = copy.copy(decode_inputs)
+    for _name, _getter, _input_key, grid_key, _token_field in _MODALITY_SPECS:
+        decode_inputs.pop(_input_key, None)
+        if grid_key is not None:
+            decode_inputs.pop(grid_key, None)
+    if decode_inputs.get("input_ids") is not None:
+        embedding = components["embed_tokens"][0]
+        with torch.no_grad():
+            decode_inputs["inputs_embeds"] = embedding(decode_inputs.pop("input_ids"))
+    components["decode"] = (decode_model, decode_inputs)
     return components

@@ -429,6 +429,27 @@ class ZambaModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixi
     def test_flash_attn_2_fp32_ln(self):
         pass
 
+    def test_associative_scan_equivalence(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        config.use_mamba_kernels = False
+
+        config.use_associative_scan = True
+        model_assoc = ZambaModel(config).to(torch_device)
+        model_assoc.eval()
+
+        config_seq = ZambaConfig(**config.to_dict())
+        config_seq.use_mamba_kernels = False
+        config_seq.use_associative_scan = False
+        model_seq = ZambaModel(config_seq).to(torch_device)
+        model_seq.load_state_dict(model_assoc.state_dict())
+        model_seq.eval()
+
+        with torch.no_grad():
+            out_assoc = model_assoc(**inputs_dict)
+            out_seq = model_seq(**inputs_dict)
+
+        torch.testing.assert_close(out_assoc.last_hidden_state, out_seq.last_hidden_state, rtol=1e-4, atol=1e-4)
+
 
 @require_torch
 class ZambaModelIntegrationTest(unittest.TestCase):
